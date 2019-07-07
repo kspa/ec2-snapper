@@ -1,27 +1,27 @@
 package main
 
 import (
-	"testing"
+	"encoding/base64"
+	"fmt"
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/mitchellh/cli"
-	"os"
-	"fmt"
 	"log"
-	"encoding/base64"
+	"os"
+	"testing"
 	"time"
 )
 
-const AWS_REGION_FOR_TESTING = "us-east-1"
-const AMAZON_LINUX_AMI_ID = "ami-08111162"
+const AWS_REGION_FOR_TESTING = "eu-west-1"
+const AMAZON_LINUX_AMI_ID = "ami-0bbc25e23a7640b9b"
 
 const TEST_FILE_PATH = "/home/ec2-user/test-file"
-const USER_DATA_TEMPLATE =
-`#!/bin/bash
+const USER_DATA_TEMPLATE = `#!/bin/bash
 set -e
 echo '%s' > "%s"
 `
+
 // An integration test that runs an EC2 instance, uses create_command to take a snapshot of it, and then delete_command
 // to delete that snapshot.
 func TestCreateAndDelete(t *testing.T) {
@@ -36,7 +36,24 @@ func TestCreateAndDelete(t *testing.T) {
 	waitForInstanceToStart(instance, svc, logger, t)
 
 	snapshotId := takeSnapshotWithVerification(instanceName, *instance.InstanceId, ui, svc, logger, t)
-	deleteSnapshotWithVerification(instanceName, snapshotId, ui, svc, logger, t)
+	deleteSnapshotWithVerification(instanceName, snapshotId, false, ui, svc, logger, t)
+}
+
+// An integration test that runs an EC2 instance, uses create_command to take a snapshot of it, and then delete_command
+// to delete that snapshot.
+func TestCreateAndDeleteByName(t *testing.T) {
+	t.Parallel()
+
+	logger, ui := createLoggerAndUi("TestCreateAndDeleteByName")
+	session := session.New(&aws.Config{Region: aws.String(AWS_REGION_FOR_TESTING)})
+	svc := ec2.New(session)
+
+	instance, instanceName := launchInstance(svc, logger, t)
+	defer terminateInstance(instance, svc, logger, t)
+	waitForInstanceToStart(instance, svc, logger, t)
+
+	snapshotId := takeSnapshotWithVerification(instanceName, *instance.InstanceId, ui, svc, logger, t)
+	deleteSnapshotWithVerification(instanceName, snapshotId, true, ui, svc, logger, t)
 }
 
 // An integration test that runs an EC2 instance, uses create_command to take a snapshot of it, and then calls the
@@ -55,10 +72,10 @@ func TestDeleteRespectsOlderThan(t *testing.T) {
 
 	snapshotId := takeSnapshotWithVerification(instanceName, *instance.InstanceId, ui, svc, logger, t)
 	// Always try to delete the snapshot at the end so the tests don't litter the AWS account with snapshots
-	defer deleteSnapshotWithVerification(instanceName, snapshotId, ui, svc, logger, t)
+	defer deleteSnapshotWithVerification(instanceName, snapshotId, false, ui, svc, logger, t)
 
 	// Set olderThan to "10h" to ensure the snapshot, which is only a few seconds old, does not get deleted
-	deleteSnapshotForInstance(instanceName, "10h", 0, ui, logger, t)
+	deleteSnapshotForInstance(instanceName, "10h", 0, false, ui, logger, t)
 	waitForSnapshotToBeDeleted(snapshotId, svc, logger, t)
 	verifySnapshotWorks(snapshotId, svc, logger, t)
 }
@@ -79,10 +96,10 @@ func TestDeleteRespectsAtLeast(t *testing.T) {
 
 	snapshotId := takeSnapshotWithVerification(instanceName, *instance.InstanceId, ui, svc, logger, t)
 	// Always try to delete the snapshot at the end so the tests don't litter the AWS account with snapshots
-	defer deleteSnapshotWithVerification(instanceName, snapshotId, ui, svc, logger, t)
+	defer deleteSnapshotWithVerification(instanceName, snapshotId, false, ui, svc, logger, t)
 
 	// Set atLeast to 1 to ensure the snapshot, which is the only one that exists, does not get deleted
-	deleteSnapshotForInstance(instanceName, "0h", 1, ui, logger, t)
+	deleteSnapshotForInstance(instanceName, "0h", 1, false, ui, logger, t)
 	waitForSnapshotToBeDeleted(snapshotId, svc, logger, t)
 	verifySnapshotWorks(snapshotId, svc, logger, t)
 }
@@ -100,7 +117,7 @@ func TestDeleteHandlesNoSnapshots(t *testing.T) {
 	defer terminateInstance(instance, svc, logger, t)
 	waitForInstanceToStart(instance, svc, logger, t)
 
-	deleteSnapshotForInstance(instanceName, "0h", 0, ui, logger, t)
+	deleteSnapshotForInstance(instanceName, "0h", 0, false, ui, logger, t)
 }
 
 func TestCreateWithInvalidInstanceName(t *testing.T) {
@@ -108,10 +125,10 @@ func TestCreateWithInvalidInstanceName(t *testing.T) {
 
 	_, ui := createLoggerAndUi("TestCreateWithInvalidInstanceName")
 	cmd := CreateCommand{
-		Ui: ui,
-		AwsRegion: AWS_REGION_FOR_TESTING,
+		Ui:           ui,
+		AwsRegion:    AWS_REGION_FOR_TESTING,
 		InstanceName: "not-a-valid-instance-name",
-		AmiName: "this-ami-should-not-be-created",
+		AmiName:      "this-ami-should-not-be-created",
 	}
 
 	_, err := create(cmd)
@@ -126,10 +143,10 @@ func TestCreateWithInvalidInstanceId(t *testing.T) {
 
 	_, ui := createLoggerAndUi("TestCreateWithInvalidInstanceId")
 	cmd := CreateCommand{
-		Ui: ui,
-		AwsRegion: AWS_REGION_FOR_TESTING,
+		Ui:         ui,
+		AwsRegion:  AWS_REGION_FOR_TESTING,
 		InstanceId: "not-a-valid-instance-id",
-		AmiName: "this-ami-should-not-be-created",
+		AmiName:    "this-ami-should-not-be-created",
 	}
 
 	_, err := create(cmd)
@@ -144,10 +161,10 @@ func TestDeleteWithInvalidInstanceName(t *testing.T) {
 
 	_, ui := createLoggerAndUi("TestDeleteWithInvalidInstanceName")
 	cmd := DeleteCommand{
-		Ui: ui,
-		AwsRegion: AWS_REGION_FOR_TESTING,
-		InstanceName: "not-a-valid-instance-name",
-		OlderThan: "0h",
+		Ui:             ui,
+		AwsRegion:      AWS_REGION_FOR_TESTING,
+		InstanceName:   "not-a-valid-instance-name",
+		OlderThan:      "0h",
 		RequireAtLeast: 0,
 	}
 
@@ -163,10 +180,10 @@ func TestDeleteWithInvalidInstanceId(t *testing.T) {
 
 	_, ui := createLoggerAndUi("TestDeleteWithInvalidInstanceId")
 	cmd := DeleteCommand{
-		Ui: ui,
-		AwsRegion: AWS_REGION_FOR_TESTING,
-		InstanceId: "not-a-valid-instance-id",
-		OlderThan: "0h",
+		Ui:             ui,
+		AwsRegion:      AWS_REGION_FOR_TESTING,
+		InstanceId:     "not-a-valid-instance-id",
+		OlderThan:      "0h",
 		RequireAtLeast: 0,
 	}
 
@@ -215,7 +232,7 @@ func launchInstance(svc *ec2.EC2, logger *log.Logger, t *testing.T) (*ec2.Instan
 func tagInstance(instance *ec2.Instance, instanceName string, svc *ec2.EC2, logger *log.Logger, t *testing.T) {
 	logger.Printf("Adding tags to instance %s", *instance.InstanceId)
 
-	_ , err := svc.CreateTags(&ec2.CreateTagsInput{
+	_, err := svc.CreateTags(&ec2.CreateTagsInput{
 		Resources: []*string{instance.InstanceId},
 		Tags: []*ec2.Tag{
 			{
@@ -242,7 +259,7 @@ func waitForInstanceToStart(instance *ec2.Instance, svc *ec2.EC2, logger *log.Lo
 func terminateInstance(instance *ec2.Instance, svc *ec2.EC2, logger *log.Logger, t *testing.T) {
 	logger.Printf("Terminating instance %s", *instance.InstanceId)
 	if _, err := svc.TerminateInstances(&ec2.TerminateInstancesInput{InstanceIds: []*string{instance.InstanceId}}); err != nil {
-		t.Fatal("Failed to terminate instance %s", *instance.InstanceId)
+		t.Fatal("Failed to terminate instance", *instance.InstanceId)
 	}
 }
 
@@ -250,10 +267,10 @@ func takeSnapshot(instanceName string, ui cli.Ui, logger *log.Logger, t *testing
 	log.Printf("Creating a snapshot with name %s.", instanceName)
 
 	cmd := CreateCommand{
-		Ui: ui,
-		AwsRegion: AWS_REGION_FOR_TESTING,
+		Ui:           ui,
+		AwsRegion:    AWS_REGION_FOR_TESTING,
 		InstanceName: instanceName,
-		AmiName: instanceName,
+		AmiName:      instanceName,
 	}
 
 	snapshotId, err := create(cmd)
@@ -306,7 +323,7 @@ func waitForSnapshotToBeAvailable(instanceId string, svc *ec2.EC2, logger *log.L
 	logger.Printf("Waiting for snapshot for instance %s to become available", instanceId)
 
 	instanceIdTagFilter := &ec2.Filter{
-		Name: aws.String(fmt.Sprintf("tag:%s", EC2_SNAPPER_INSTANCE_ID_TAG)),
+		Name:   aws.String(fmt.Sprintf("tag:%s", EC2_SNAPPER_INSTANCE_ID_TAG)),
 		Values: []*string{aws.String(instanceId)},
 	}
 
@@ -322,15 +339,16 @@ func waitForSnapshotToBeDeleted(snapshotId string, svc *ec2.EC2, logger *log.Log
 	time.Sleep(30 * time.Second)
 }
 
-func deleteSnapshotForInstance(instanceName string, olderThan string, requireAtLeast int, ui cli.Ui, logger *log.Logger, t *testing.T) {
+func deleteSnapshotForInstance(instanceName string, olderThan string, requireAtLeast int, skipInstanceId bool, ui cli.Ui, logger *log.Logger, t *testing.T) {
 	logger.Printf("Deleting snapshot for instance %s", instanceName)
 
 	deleteCmd := DeleteCommand{
-		Ui: ui,
-		AwsRegion: AWS_REGION_FOR_TESTING,
-		InstanceName: instanceName,
-		OlderThan: olderThan,
+		Ui:             ui,
+		AwsRegion:      AWS_REGION_FOR_TESTING,
+		InstanceName:   instanceName,
+		OlderThan:      olderThan,
 		RequireAtLeast: requireAtLeast,
+		SkipInstanceId: skipInstanceId,
 	}
 
 	if err := deleteSnapshots(deleteCmd); err != nil {
@@ -347,14 +365,14 @@ func takeSnapshotWithVerification(instanceName string, instanceId string, ui cli
 	return snapshotId
 }
 
-func deleteSnapshotWithVerification(instanceName string, snapshotId string, ui cli.Ui, svc *ec2.EC2, logger *log.Logger, t *testing.T) {
-	deleteSnapshotForInstance(instanceName, "0h", 0, ui, logger, t)
+func deleteSnapshotWithVerification(instanceName string, snapshotId string, skipInstanceId bool, ui cli.Ui, svc *ec2.EC2, logger *log.Logger, t *testing.T) {
+	deleteSnapshotForInstance(instanceName, "0h", 0, skipInstanceId, ui, logger, t)
 	waitForSnapshotToBeDeleted(snapshotId, svc, logger, t)
 	verifySnapshotIsDeleted(snapshotId, svc, logger, t)
 }
 
 func createLoggerAndUi(testName string) (*log.Logger, cli.Ui) {
-	logger := log.New(os.Stdout, testName + " ", log.LstdFlags)
+	logger := log.New(os.Stdout, testName+" ", log.LstdFlags)
 
 	basicUi := &cli.BasicUi{
 		Reader:      os.Stdin,
@@ -363,15 +381,14 @@ func createLoggerAndUi(testName string) (*log.Logger, cli.Ui) {
 	}
 
 	prefixedUi := &cli.PrefixedUi{
-		AskPrefix:		logger.Prefix(),
-		AskSecretPrefix:	logger.Prefix(),
-		OutputPrefix:		logger.Prefix(),
-		InfoPrefix:		logger.Prefix(),
-		ErrorPrefix:		logger.Prefix(),
-		WarnPrefix:		logger.Prefix(),
-		Ui:			basicUi,
-		
+		AskPrefix:       logger.Prefix(),
+		AskSecretPrefix: logger.Prefix(),
+		OutputPrefix:    logger.Prefix(),
+		InfoPrefix:      logger.Prefix(),
+		ErrorPrefix:     logger.Prefix(),
+		WarnPrefix:      logger.Prefix(),
+		Ui:              basicUi,
 	}
-	
+
 	return logger, prefixedUi
 }

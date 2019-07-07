@@ -2,15 +2,15 @@ package main
 
 import (
 	"flag"
-	"time"
 	"strings"
+	"time"
 
+	"errors"
+	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/mitchellh/cli"
-	"errors"
-	"fmt"
 )
 
 type CreateCommand struct {
@@ -24,6 +24,7 @@ type CreateCommand struct {
 }
 
 const EC2_SNAPPER_INSTANCE_ID_TAG = "ec2-snapper-instance-id"
+const EC2_SNAPPER_NAME_TAG = "Name"
 
 // descriptions for args
 var createDscrAwsRegion = "The AWS region to use (e.g. us-west-2)"
@@ -104,10 +105,10 @@ func create(c CreateCommand) (string, error) {
 	c.Ui.Output("==> Creating AMI for " + c.InstanceId + "...")
 
 	resp, err := svc.CreateImage(&ec2.CreateImageInput{
-		Name: &name,
+		Name:       &name,
 		InstanceId: &c.InstanceId,
-		DryRun: &c.DryRun,
-		NoReboot: &c.NoReboot })
+		DryRun:     &c.DryRun,
+		NoReboot:   &c.NoReboot})
 	if err != nil && strings.Contains(err.Error(), "NoCredentialProviders") {
 		return snapshotId, errors.New("ERROR: No AWS credentials were found.  Either set the environment variables AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or run this program on an EC2 instance that has an IAM Role with the appropriate permissions.")
 	} else if err != nil {
@@ -124,8 +125,8 @@ func create(c CreateCommand) (string, error) {
 	_, tagsErr := svc.CreateTags(&ec2.CreateTagsInput{
 		Resources: []*string{&snapshotId},
 		Tags: []*ec2.Tag{
-			&ec2.Tag{ Key: aws.String(EC2_SNAPPER_INSTANCE_ID_TAG), Value: &c.InstanceId },
-			&ec2.Tag{ Key: aws.String("Name"), Value: &c.AmiName },
+			&ec2.Tag{Key: aws.String(EC2_SNAPPER_INSTANCE_ID_TAG), Value: &c.InstanceId},
+			&ec2.Tag{Key: aws.String("Name"), Value: &c.AmiName},
 		},
 	})
 
@@ -137,7 +138,7 @@ func create(c CreateCommand) (string, error) {
 	respDscrImages, err := svc.DescribeImages(&ec2.DescribeImagesInput{
 		Filters: []*ec2.Filter{
 			&ec2.Filter{
-				Name: aws.String("image-id"),
+				Name:   aws.String("image-id"),
 				Values: []*string{&snapshotId},
 			},
 		},
@@ -165,8 +166,8 @@ func create(c CreateCommand) (string, error) {
 			_, err := svc.CreateTags(&ec2.CreateTagsInput{
 				Resources: []*string{blockDeviceMapping.Ebs.SnapshotId},
 				Tags: []*ec2.Tag{
-					&ec2.Tag{ Key: aws.String(EC2_SNAPPER_INSTANCE_ID_TAG), Value: &c.InstanceId },
-					&ec2.Tag{ Key: aws.String("Name"), Value: aws.String(c.AmiName + "-" + *blockDeviceMapping.DeviceName) },
+					&ec2.Tag{Key: aws.String(EC2_SNAPPER_INSTANCE_ID_TAG), Value: &c.InstanceId},
+					&ec2.Tag{Key: aws.String("Name"), Value: aws.String(c.AmiName + "-" + *blockDeviceMapping.DeviceName)},
 				},
 			})
 
@@ -201,7 +202,7 @@ func getInstanceIdByName(instanceName string, svc *ec2.EC2, ui cli.Ui) (string, 
 	ui.Output(fmt.Sprintf("Looking up id for instance named %s", instanceName))
 
 	nameTagFilter := ec2.Filter{
-		Name: aws.String("tag:Name"),
+		Name:   aws.String("tag:Name"),
 		Values: []*string{aws.String(instanceName)},
 	}
 

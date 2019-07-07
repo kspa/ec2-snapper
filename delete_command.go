@@ -7,44 +7,47 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mitchellh/cli"
+	"errors"
+	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/mitchellh/cli"
 	"math"
-	"errors"
-	"fmt"
 )
 
 type DeleteCommand struct {
-	Ui 			cli.Ui
-	AwsRegion 		string
-	InstanceId 		string
-	InstanceName 		string
-	OlderThan 		string
-	RequireAtLeast		int
-	DryRun			bool
+	Ui             cli.Ui
+	AwsRegion      string
+	InstanceId     string
+	InstanceName   string
+	SkipInstanceId bool
+	OlderThan      string
+	RequireAtLeast int
+	DryRun         bool
 }
 
 // descriptions for args
 var deleteDscrAwsRegion = "The AWS region to use (e.g. us-west-2)"
 var deleteDscrInstanceId = "The ID of the EC2 instance from which the AMIs to be deleted were originally created."
 var deleteDscrInstanceName = "The name (from tags) of the EC2 instance from which the AMIs to be deleted were originally created."
+var deleteSkipInstanceId = "Checking the ID of the EC2 instance is skipped. The Name tag of the EC2 instance or the AMI is used instead to find the AMIs and snapshots."
 var deleteOlderThan = "Delete AMIs older than the specified time; accepts formats like '30d' or '4h'."
 var requireAtLeast = "Never delete AMIs such that fewer than this number of AMIs will remain. E.g. require at least 3 AMIs remain."
 var deleteDscrDryRun = "Execute a simulated run. Lists AMIs to be deleted, but does not actually delete them."
 
 func (c *DeleteCommand) Help() string {
-	return `ec2-snapper create <args> [--help]
+	return `ec2-snapper delete <args> [--help]
 
-Create an AMI of the given EC2 instance.
+Delete an AMI of the given EC2 instance.
 
 Available args are:
 --region      		` + deleteDscrAwsRegion + `
 --instance-id      	` + deleteDscrInstanceId + `
---instance-name      	` + deleteDscrInstanceName + `
+--instance-name    	` + deleteDscrInstanceName + `
+--skip-instance-id	` + deleteSkipInstanceId + `
 --older-than    	` + deleteOlderThan + `
---require-at-least      ` + requireAtLeast + `
+--require-at-least	` + requireAtLeast + `
 --dry-run       	` + deleteDscrDryRun
 }
 
@@ -63,6 +66,7 @@ func (c *DeleteCommand) Run(args []string) int {
 	cmdFlags.StringVar(&c.AwsRegion, "region", "", deleteDscrAwsRegion)
 	cmdFlags.StringVar(&c.InstanceId, "instance-id", "", deleteDscrInstanceId)
 	cmdFlags.StringVar(&c.InstanceName, "instance-name", "", deleteDscrInstanceId)
+	cmdFlags.BoolVar(&c.SkipInstanceId, "skip-instance-id", false, deleteSkipInstanceId)
 	cmdFlags.StringVar(&c.OlderThan, "older-than", "", deleteOlderThan)
 	cmdFlags.IntVar(&c.RequireAtLeast, "require-at-least", 0, requireAtLeast)
 	cmdFlags.BoolVar(&c.DryRun, "dry-run", false, deleteDscrDryRun)
@@ -80,6 +84,9 @@ func (c *DeleteCommand) Run(args []string) int {
 }
 
 func deleteSnapshots(c DeleteCommand) error {
+	var images []*ec2.Image
+	var err error
+
 	if err := validateDeleteArgs(c); err != nil {
 		return err
 	}
@@ -91,30 +98,45 @@ func deleteSnapshots(c DeleteCommand) error {
 	session := session.New(&aws.Config{Region: &c.AwsRegion})
 	svc := ec2.New(session)
 
-	if c.InstanceId == "" {
-		instanceId, err := getInstanceIdByName(c.InstanceName, svc, c.Ui)
+	if c.SkipInstanceId {
+
+		images, err = findImagesByName(c.InstanceName, svc)
 		if err != nil {
 			return err
 		}
-		c.InstanceId = instanceId
+
+		if len(images) == 0 {
+			c.Ui.Info("NO ACTION TAKEN. There are no existing snapshots with name " + c.InstanceName + " to delete.")
+			return nil
+		}
+
 	} else {
-		result, err := svc.DescribeInstances(&ec2.DescribeInstancesInput{InstanceIds: []*string{aws.String(c.InstanceId)}})
+
+		if c.InstanceId == "" {
+			instanceId, err := getInstanceIdByName(c.InstanceName, svc, c.Ui)
+			if err != nil {
+				return err
+			}
+			c.InstanceId = instanceId
+		} else {
+			result, err := svc.DescribeInstances(&ec2.DescribeInstancesInput{InstanceIds: []*string{aws.String(c.InstanceId)}})
+			if err != nil {
+				return err
+			}
+			if len(result.Reservations) == 0 || len(result.Reservations[0].Instances) == 0 {
+				return fmt.Errorf("Could not find an instance with id %s", c.InstanceId)
+			}
+		}
+
+		images, err = findImages(c.InstanceId, svc)
 		if err != nil {
 			return err
 		}
-		if len(result.Reservations) == 0 || len(result.Reservations[0].Instances) == 0 {
-			return fmt.Errorf("Could not find an instance with id %s", c.InstanceId)
+
+		if len(images) == 0 {
+			c.Ui.Info("NO ACTION TAKEN. There are no existing snapshots of instance " + c.InstanceId + " to delete.")
+			return nil
 		}
-	}
-
-	images, err := findImages(c.InstanceId, svc)
-	if err != nil {
-		return err
-	}
-
-	if len(images) == 0 {
-		c.Ui.Info("NO ACTION TAKEN. There are no existing snapshots of instance " + c.InstanceId + " to delete.")
-		return nil
 	}
 
 	// Check that at least the --require-at-least number of AMIs exists
@@ -153,7 +175,7 @@ func deleteSnapshots(c DeleteCommand) error {
 
 	var numAmisToRemoveFromFiltered = computeNumAmisToRemove(images, filteredAmis, c.RequireAtLeast)
 	if numAmisToRemoveFromFiltered > 0.0 {
-		c.Ui.Output("==> Only deleting " + strconv.Itoa(len(filteredAmis) - int(numAmisToRemoveFromFiltered)) + " total AMIs to honor '--require-at-least=" + strconv.Itoa(c.RequireAtLeast) + "'.")
+		c.Ui.Output("==> Only deleting " + strconv.Itoa(len(filteredAmis)-int(numAmisToRemoveFromFiltered)) + " total AMIs to honor '--require-at-least=" + strconv.Itoa(c.RequireAtLeast) + "'.")
 	}
 
 	if err := deleteAmis(filteredAmis, allSnapshots, numAmisToRemoveFromFiltered, svc, c.DryRun, c.Ui); err != nil {
@@ -163,7 +185,7 @@ func deleteSnapshots(c DeleteCommand) error {
 	if c.DryRun {
 		c.Ui.Info("==> DRY RUN. Had this not been a dry run, " + strconv.Itoa(len(filteredAmis)) + " AMI's and their corresponding snapshots would have been deleted.")
 	} else {
-		c.Ui.Info("==> Success! Deleted " + strconv.Itoa(len(filteredAmis) - int(numAmisToRemoveFromFiltered)) + " AMI's and their corresponding snapshots.")
+		c.Ui.Info("==> Success! Deleted " + strconv.Itoa(len(filteredAmis)-int(numAmisToRemoveFromFiltered)) + " AMI's and their corresponding snapshots.")
 	}
 	return nil
 }
@@ -188,7 +210,7 @@ func computeNumAmisToRemove(images []*ec2.Image, filteredAmis []*ec2.Image, requ
 	var numTotalAmis = len(images)
 	var numFilteredAmis = len(filteredAmis)
 	var numAmisToRemainAfterDelete = numTotalAmis - numFilteredAmis
-	return math.Max(0.0, float64(requireAtLeast - numAmisToRemainAfterDelete))
+	return math.Max(0.0, float64(requireAtLeast-numAmisToRemainAfterDelete))
 }
 
 // Check for required command-line args
@@ -199,6 +221,10 @@ func validateDeleteArgs(c DeleteCommand) error {
 
 	if (c.InstanceId == "" && c.InstanceName == "") || (c.InstanceId != "" && c.InstanceName != "") {
 		return errors.New("ERROR: You must specify exactly one of '--instance-id' or '--instance-name'.")
+	}
+
+	if (c.SkipInstanceId && c.InstanceName == "") || (c.SkipInstanceId && c.InstanceId != "") {
+		return errors.New("ERROR: You must specify the '--instance-name' in combination with '--skip-instance-id=true'.")
 	}
 
 	if c.OlderThan == "" {
@@ -214,7 +240,7 @@ func validateDeleteArgs(c DeleteCommand) error {
 
 // Now filter the AMIs to only include those within our date range
 func filterImagesByDateRange(images []*ec2.Image, olderThanHours float64) ([]*ec2.Image, error) {
-	var filteredAmis[]*ec2.Image
+	var filteredAmis []*ec2.Image
 
 	for i := 0; i < len(images); i++ {
 		now := time.Now()
@@ -241,7 +267,7 @@ func findImages(instanceId string, svc *ec2.EC2) ([]*ec2.Image, error) {
 	resp, err := svc.DescribeImages(&ec2.DescribeImagesInput{
 		Filters: []*ec2.Filter{
 			&ec2.Filter{
-				Name: aws.String(fmt.Sprintf("tag:%s", EC2_SNAPPER_INSTANCE_ID_TAG)),
+				Name:   aws.String(fmt.Sprintf("tag:%s", EC2_SNAPPER_INSTANCE_ID_TAG)),
 				Values: []*string{&instanceId},
 			},
 		},
@@ -255,16 +281,38 @@ func findImages(instanceId string, svc *ec2.EC2) ([]*ec2.Image, error) {
 	return resp.Images, nil
 }
 
+// Get a list of the existing AMIs that were created for the given EC2 Name tag
+func findImagesByName(name string, svc *ec2.EC2) ([]*ec2.Image, error) {
+	var noImages []*ec2.Image
+
+	// Get a list of the existing AMIs that were created for the given EC2 Name tag
+	resp, err := svc.DescribeImages(&ec2.DescribeImagesInput{
+		Filters: []*ec2.Filter{
+			&ec2.Filter{
+				Name:   aws.String(fmt.Sprintf("tag:%s", EC2_SNAPPER_NAME_TAG)),
+				Values: []*string{&name},
+			},
+		},
+	})
+	if err != nil && strings.Contains(err.Error(), "NoCredentialProviders") {
+		return noImages, errors.New("ERROR: No AWS credentials were found.  Either set the environment variables AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or run this program on an EC2 instance that has an IAM Role with the appropriate permissions.")
+	} else if err != nil {
+		return noImages, err
+	}
+
+	return resp.Images, nil
+}
+
 func deleteAmis(amis []*ec2.Image, snapshots []*ec2.Snapshot, numAmisToRemoveFromFiltered float64, svc *ec2.EC2, dryRun bool, ui cli.Ui) error {
-	for i := 0; i < len(amis) - int(numAmisToRemoveFromFiltered); i++ {
+	for i := 0; i < len(amis)-int(numAmisToRemoveFromFiltered); i++ {
 		// Step 1: De-register the AMI
 		ui.Output(*amis[i].ImageId + ": De-registering AMI named \"" + *amis[i].Name + "\"...")
 		_, err := svc.DeregisterImage(&ec2.DeregisterImageInput{
-			DryRun: &dryRun,
+			DryRun:  &dryRun,
 			ImageId: amis[i].ImageId,
 		})
 		if err != nil {
-			if ! strings.Contains(err.Error(), "DryRunOperation") {
+			if !strings.Contains(err.Error(), "DryRunOperation") {
 				return err
 			}
 		}
@@ -283,7 +331,7 @@ func deleteAmis(amis []*ec2.Image, snapshots []*ec2.Snapshot, numAmisToRemoveFro
 		for _, snapshotId := range snapshotIds {
 			ui.Output(*amis[i].ImageId + ": Deleting snapshot " + snapshotId + "...")
 			_, deleteErr := svc.DeleteSnapshot(&ec2.DeleteSnapshotInput{
-				DryRun: &dryRun,
+				DryRun:     &dryRun,
 				SnapshotId: &snapshotId,
 			})
 
@@ -306,7 +354,7 @@ func parseOlderThanToHours(olderThan string) (float64, error) {
 
 	// Parse our date range
 	match, _ := regexp.MatchString("^[0-9]*(h|d|m)$", olderThan)
-	if ! match {
+	if !match {
 		return hours, errors.New("The --older-than value of \"" + olderThan + "\" is not formatted properly.  Use formats like 30d or 24h")
 	}
 
@@ -324,7 +372,7 @@ func parseOlderThanToHours(olderThan string) (float64, error) {
 	// We were given a time like "5m"
 	if match, _ := regexp.MatchString("^[0-9]*(m)$", olderThan); match {
 		minutes, _ = strconv.ParseFloat(olderThan[0:len(olderThan)-1], 64)
-		hours = minutes/60
+		hours = minutes / 60
 	}
 
 	return hours, nil
